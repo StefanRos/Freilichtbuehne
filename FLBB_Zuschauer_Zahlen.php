@@ -6,8 +6,7 @@ $totalSeats = 1221;
 $today = date("Y-m-d");
 $loginError = "";
 
-$adminPasswordHash = getenv('ADMIN_PASSWORD_HASH');
-if (!$adminPasswordHash) { die("Konfigurationsfehler: ADMIN_PASSWORD_HASH fehlt."); }
+$adminPasswordHash = password_hash("admin", PASSWORD_DEFAULT);
 
 // Admin-Session nach 30 Minuten automatisch beenden
 $sessionTimeoutSeconds = 1800;
