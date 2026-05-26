@@ -1,0 +1,18 @@
+services:
+  php:
+    build: .
+    env_file: .env
+    volumes:
+      - ./FLBB_Zuschauer_Zahlen.php:/var/www/html/FLBB_Zuschauer_Zahlen.php:ro
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "3002:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./FLBB_Zuschauer_Zahlen.php:/var/www/html/FLBB_Zuschauer_Zahlen.php:ro
+    depends_on:
+      - php
+    restart: unless-stopped
