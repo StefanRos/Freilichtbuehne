@@ -28,6 +28,12 @@ Bei Aenderungen an diesem Projekt immer den kompletten Ablauf einhalten:
 
 Der Server ist die laufende Umgebung fuer dieses Projekt.
 
+SSH-Ziel:
+
+- Alias: `freilichtbuehne-server`
+- User/Host: `stefan@192.168.178.184`
+- Lokaler Key: `C:\Users\Lasse\.ssh\freilichtbuehne_192_168_178_184`
+
 ## Architektur
 
 - Keine Composer-Abhaengigkeiten, kein Build-Step.
