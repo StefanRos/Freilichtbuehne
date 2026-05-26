@@ -836,7 +836,7 @@ $lastUpdate = date("d.m.Y H:i:s");
             <div class="selector-title">Vorstellung auswählen</div>
 
             <div class="form-row">
-                <select name="event">
+                <select name="event" onchange="this.form.submit()">
                     <?php foreach ($selectedShow["events"] as $eventKey => $event): ?>
                         <option value="<?= safe($eventKey) ?>" <?= $eventKey === $selectedEventKey ? "selected" : "" ?>>
                             <?= safe($event["label"]) ?>
