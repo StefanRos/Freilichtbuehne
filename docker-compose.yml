@@ -1,7 +1,7 @@
 services:
   php:
     build: .
-    env_file: .env
+    env_file: .env.app
     volumes:
       - ./FLBB_Zuschauer_Zahlen.php:/var/www/html/FLBB_Zuschauer_Zahlen.php:ro
     restart: unless-stopped
