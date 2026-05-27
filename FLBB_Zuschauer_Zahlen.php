@@ -523,27 +523,6 @@ if ($isAdmin && $_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["admin_act
         }
     }
 
-    if ($action === "add_event") {
-        $showKey = $_POST["show_key"] ?? "";
-
-        if (isset($shows[$showKey])) {
-            $eventResult = buildEventFromEventJsonLink($_POST["event_link"] ?? "", trim($_POST["extra_label"] ?? ""));
-
-            if ($eventResult["ok"]) {
-                $shows[$showKey]["events"][$eventResult["key"]] = $eventResult["event"];
-                $shows[$showKey]["events"] = sortEventsByDate($shows[$showKey]["events"]);
-
-                if (saveEditableShows($shows)) {
-                    $adminMessage = "Vorstellung wurde hinzugefügt.";
-                } else {
-                    $adminError = "Vorstellung konnte nicht gespeichert werden.";
-                }
-            } else {
-                $adminError = $eventResult["error"];
-            }
-        }
-    }
-
     if ($action === "update_show") {
         $showKey = $_POST["show_key"] ?? "";
 
@@ -1851,24 +1830,6 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
                                     </div>
                                 <?php endforeach; ?>
 
-                                <div class="admin-event-edit">
-                                    <form method="post" class="admin-form">
-                                        <input type="hidden" name="admin_action" value="add_event">
-                                        <input type="hidden" name="show_key" value="<?= safe($editShowKey) ?>">
-
-                                        <label>
-                                            Neue Vorstellung per event.json-Link
-                                            <input type="url" name="event_link" placeholder="https://tickets.freilichtspiele-badbentheim.de/.../seating/.../event.json" required>
-                                        </label>
-
-                                        <label>
-                                            Zusatz im Label
-                                            <input type="text" name="extra_label" placeholder="optional, z. B. Premiere">
-                                        </label>
-
-                                        <button class="submit-button" type="submit" style="padding: 10px 14px;">Vorstellung hinzufügen</button>
-                                    </form>
-                                </div>
                             </div>
 
                             <form method="post" onsubmit="return confirm('Diese Veranstaltung wirklich löschen?');" style="margin-top: 8px;">
