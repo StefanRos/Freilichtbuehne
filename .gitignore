@@ -1,5 +1,3 @@
 .env
 .env.app
 .DS_Store
-data/events.json
-data/backups/

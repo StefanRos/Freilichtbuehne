@@ -4,7 +4,6 @@ services:
     env_file: .env.app
     volumes:
       - ./FLBB_Zuschauer_Zahlen.php:/var/www/html/FLBB_Zuschauer_Zahlen.php:ro
-      - ./data:/var/www/html/data
     restart: unless-stopped
 
   nginx:
