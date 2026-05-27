@@ -6,7 +6,11 @@ $totalSeats = 1221;
 $today = date("Y-m-d");
 $loginError = "";
 
-$adminPasswordHash = password_hash("admin", PASSWORD_DEFAULT);
+$adminPasswordHash = getenv('ADMIN_PASSWORD_HASH');
+if (!$adminPasswordHash) { die("Konfigurationsfehler: ADMIN_PASSWORD_HASH fehlt."); }
+
+$cacheSeconds = 60;
+$staleCacheSeconds = 3600;
 
 // Admin-Session nach 30 Minuten automatisch beenden
 $sessionTimeoutSeconds = 1800;
@@ -134,15 +138,74 @@ if (!$isAdmin) {
     }
 }
 
-function loadJson($url, $referer) {
+function cacheFileForUrl($url) {
+    $cacheDir = sys_get_temp_dir() . "/flbb_pretix_cache";
+
+    if (!is_dir($cacheDir)) {
+        @mkdir($cacheDir, 0775, true);
+    }
+
+    return $cacheDir . "/" . sha1($url) . ".json";
+}
+
+function readCachedJson($cacheFile) {
+    if (!is_file($cacheFile)) {
+        return null;
+    }
+
+    $payload = json_decode((string)@file_get_contents($cacheFile), true);
+
+    if (!is_array($payload) || !isset($payload["created_at"], $payload["json"])) {
+        return null;
+    }
+
+    $data = json_decode((string)$payload["json"], true);
+
+    if ($data === null) {
+        return null;
+    }
+
+    return [
+        "created_at" => (int)$payload["created_at"],
+        "data" => $data
+    ];
+}
+
+function writeCachedJson($cacheFile, $json) {
+    $payload = json_encode([
+        "created_at" => time(),
+        "json" => $json
+    ]);
+
+    if ($payload !== false) {
+        @file_put_contents($cacheFile, $payload, LOCK_EX);
+    }
+}
+
+function loadJson($url, $referer, $cacheSeconds, $staleCacheSeconds) {
+    $cacheFile = cacheFileForUrl($url);
+    $cached = readCachedJson($cacheFile);
+
+    if ($cached !== null && time() - $cached["created_at"] <= $cacheSeconds) {
+        return [
+            "ok" => true,
+            "error" => null,
+            "warning" => null,
+            "data" => $cached["data"],
+            "cached" => true,
+            "stale" => false,
+            "fetchedAt" => $cached["created_at"]
+        ];
+    }
+
     $ch = curl_init();
 
     curl_setopt_array($ch, [
         CURLOPT_URL => $url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_TIMEOUT => 20,
-        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 8,
+        CURLOPT_CONNECTTIMEOUT => 4,
         CURLOPT_HTTPHEADER => [
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept: application/json,text/plain,*/*",
@@ -153,52 +216,105 @@ function loadJson($url, $referer) {
     $json = curl_exec($ch);
 
     if ($json === false) {
-        return ["ok" => false, "error" => "cURL Fehler: " . curl_error($ch), "data" => null];
+        $error = "cURL Fehler: " . curl_error($ch);
+        curl_close($ch);
+
+        if ($cached !== null && time() - $cached["created_at"] <= $staleCacheSeconds) {
+            return [
+                "ok" => true,
+                "error" => null,
+                "warning" => $error,
+                "data" => $cached["data"],
+                "cached" => true,
+                "stale" => true,
+                "fetchedAt" => $cached["created_at"]
+            ];
+        }
+
+        return ["ok" => false, "error" => $error, "warning" => null, "data" => null, "cached" => false, "stale" => false, "fetchedAt" => null];
     }
 
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
     if ($httpCode !== 200) {
-        return ["ok" => false, "error" => "Server antwortet mit HTTP-Code " . $httpCode, "data" => null];
+        $error = "Server antwortet mit HTTP-Code " . $httpCode;
+
+        if ($cached !== null && time() - $cached["created_at"] <= $staleCacheSeconds) {
+            return [
+                "ok" => true,
+                "error" => null,
+                "warning" => $error,
+                "data" => $cached["data"],
+                "cached" => true,
+                "stale" => true,
+                "fetchedAt" => $cached["created_at"]
+            ];
+        }
+
+        return ["ok" => false, "error" => $error, "warning" => null, "data" => null, "cached" => false, "stale" => false, "fetchedAt" => null];
     }
 
     $data = json_decode($json, true);
 
     if ($data === null) {
-        return ["ok" => false, "error" => "JSON konnte nicht gelesen werden.", "data" => null];
+        $error = "JSON konnte nicht gelesen werden.";
+
+        if ($cached !== null && time() - $cached["created_at"] <= $staleCacheSeconds) {
+            return [
+                "ok" => true,
+                "error" => null,
+                "warning" => $error,
+                "data" => $cached["data"],
+                "cached" => true,
+                "stale" => true,
+                "fetchedAt" => $cached["created_at"]
+            ];
+        }
+
+        return ["ok" => false, "error" => $error, "warning" => null, "data" => null, "cached" => false, "stale" => false, "fetchedAt" => null];
     }
 
-    return ["ok" => true, "error" => null, "data" => $data];
+    writeCachedJson($cacheFile, $json);
+
+    return [
+        "ok" => true,
+        "error" => null,
+        "warning" => null,
+        "data" => $data,
+        "cached" => false,
+        "stale" => false,
+        "fetchedAt" => time()
+    ];
 }
 
-function calculateNumbers($event, $totalSeats) {
-    $result = loadJson($event["url"], $event["referer"]);
+function emptyNumbers($error) {
+    return [
+        "ok" => false,
+        "error" => $error,
+        "warning" => null,
+        "freeTotal" => 0,
+        "blockedSeats" => 0,
+        "usagePercent" => 0,
+        "freeLeft" => 0,
+        "freeRight" => 0,
+        "cached" => false,
+        "stale" => false,
+        "fetchedAt" => null
+    ];
+}
+
+function calculateNumbers($event, $totalSeats, $cacheSeconds, $staleCacheSeconds) {
+    $result = loadJson($event["url"], $event["referer"], $cacheSeconds, $staleCacheSeconds);
 
     if (!$result["ok"]) {
-        return [
-            "ok" => false,
-            "error" => $result["error"],
-            "freeTotal" => 0,
-            "blockedSeats" => 0,
-            "usagePercent" => 0,
-            "freeLeft" => 0,
-            "freeRight" => 0
-        ];
+        return emptyNumbers($result["error"]);
     }
 
     $eventData = $result["data"];
 
     if (!isset($eventData["available_seats"]) || !is_array($eventData["available_seats"])) {
-        return [
-            "ok" => false,
-            "error" => "Keine available_seats gefunden.",
-            "freeTotal" => 0,
-            "blockedSeats" => 0,
-            "usagePercent" => 0,
-            "freeLeft" => 0,
-            "freeRight" => 0
-        ];
+        return emptyNumbers("Keine available_seats gefunden.");
     }
 
     $availableSeats = $eventData["available_seats"];
@@ -207,17 +323,29 @@ function calculateNumbers($event, $totalSeats) {
     $blockedSeats = $totalSeats - $freeTotal;
     $usagePercent = round(($blockedSeats / $totalSeats) * 100, 1);
 
-    $freeLeft = count(array_filter($availableSeats, fn($s) => str_starts_with($s, "Links-")));
-    $freeRight = count(array_filter($availableSeats, fn($s) => str_starts_with($s, "Rechts-")));
+    $freeLeft = 0;
+    $freeRight = 0;
+
+    foreach ($availableSeats as $seat) {
+        if (str_starts_with($seat, "Links-")) {
+            $freeLeft++;
+        } elseif (str_starts_with($seat, "Rechts-")) {
+            $freeRight++;
+        }
+    }
 
     return [
         "ok" => true,
         "error" => null,
+        "warning" => $result["warning"],
         "freeTotal" => $freeTotal,
         "blockedSeats" => $blockedSeats,
         "usagePercent" => $usagePercent,
         "freeLeft" => $freeLeft,
-        "freeRight" => $freeRight
+        "freeRight" => $freeRight,
+        "cached" => $result["cached"],
+        "stale" => $result["stale"],
+        "fetchedAt" => $result["fetchedAt"]
     ];
 }
 
@@ -264,10 +392,11 @@ if (!isset($selectedShow["events"][$selectedEventKey])) {
 }
 
 $selectedEvent = $selectedShow["events"][$selectedEventKey];
-$numbers = calculateNumbers($selectedEvent, $totalSeats);
+$numbers = calculateNumbers($selectedEvent, $totalSeats, $cacheSeconds, $staleCacheSeconds);
 $status = getStatusText($numbers);
 
-$lastUpdate = date("d.m.Y H:i:s");
+$lastUpdate = $numbers["fetchedAt"] ? date("d.m.Y H:i:s", $numbers["fetchedAt"]) : date("d.m.Y H:i:s");
+$showArchive = $isAdmin && isset($_GET["archive"]) && $_GET["archive"] === "1";
 ?>
 
 <!DOCTYPE html>
@@ -868,7 +997,10 @@ $lastUpdate = date("d.m.Y H:i:s");
             </div>
 
             <div class="update">
-                Live-Stand: <?= safe($lastUpdate) ?>
+                Datenstand: <?= safe($lastUpdate) ?>
+                <?php if ($numbers["cached"]): ?>
+                    · aus Zwischenspeicher
+                <?php endif; ?>
                 <?php if (!$isAdmin): ?>
                     · Aktualisierung alle 60 Sekunden
                 <?php endif; ?>
@@ -892,6 +1024,15 @@ $lastUpdate = date("d.m.Y H:i:s");
                 Die Sitzplatzdaten konnten gerade nicht geladen werden. Bitte später erneut versuchen.
             </div>
         <?php endif; ?>
+    <?php endif; ?>
+
+    <?php if ($numbers["ok"] && $numbers["stale"]): ?>
+        <div class="<?= $isAdmin ? "error" : "friendly-error" ?>">
+            Pretix ist gerade nicht erreichbar. Angezeigt wird der zwischengespeicherte Stand von <?= safe($lastUpdate) ?>.
+            <?php if ($isAdmin && !empty($numbers["warning"])): ?>
+                Ursache: <?= safe($numbers["warning"]) ?>
+            <?php endif; ?>
+        </div>
     <?php endif; ?>
 
     <div class="grid">
@@ -939,9 +1080,14 @@ $lastUpdate = date("d.m.Y H:i:s");
         <div class="admin-box" style="margin-top: 22px;">
             <div class="selector-title">Admin-Archiv aller Vorstellungen</div>
             <div class="source">
-                Die Tabelle lädt die aktuellen Werte live aus den jeweiligen event.json-Dateien.
+                Die Tabelle nutzt den Zwischenspeicher und wird erst auf Klick geladen.
             </div>
 
+            <?php if (!$showArchive): ?>
+                <a class="ticket-link" href="?show=<?= safe($selectedShowKey) ?>&event=<?= safe($selectedEventKey) ?>&archive=1">
+                    Archiv laden
+                </a>
+            <?php else: ?>
             <div class="admin-table-wrap">
                 <table class="admin-table">
                     <thead>
@@ -960,7 +1106,7 @@ $lastUpdate = date("d.m.Y H:i:s");
                         <?php foreach ($allShows as $adminShow): ?>
                             <?php foreach ($adminShow["events"] as $adminEvent): ?>
                                 <?php
-                                    $adminNumbers = calculateNumbers($adminEvent, $totalSeats);
+                                    $adminNumbers = calculateNumbers($adminEvent, $totalSeats, $cacheSeconds, $staleCacheSeconds);
                                     $isPast = $adminEvent["date_iso"] < $today;
                                 ?>
                                 <tr class="<?= $isPast ? "past" : "future" ?>">
@@ -978,6 +1124,7 @@ $lastUpdate = date("d.m.Y H:i:s");
                     </tbody>
                 </table>
             </div>
+            <?php endif; ?>
         </div>
     <?php endif; ?>
 
