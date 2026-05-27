@@ -148,6 +148,16 @@ function cacheFileForUrl($url) {
     return $cacheDir . "/" . sha1($url) . ".json";
 }
 
+function snapshotFileForEvent($event) {
+    $snapshotDir = sys_get_temp_dir() . "/flbb_pretix_snapshots";
+
+    if (!is_dir($snapshotDir)) {
+        @mkdir($snapshotDir, 0775, true);
+    }
+
+    return $snapshotDir . "/" . sha1($event["url"]) . ".json";
+}
+
 function readCachedJson($cacheFile) {
     if (!is_file($cacheFile)) {
         return null;
@@ -300,7 +310,10 @@ function emptyNumbers($error) {
         "freeRight" => 0,
         "cached" => false,
         "stale" => false,
-        "fetchedAt" => null
+        "fetchedAt" => null,
+        "trendSeats" => null,
+        "trendText" => "Keine Daten",
+        "forecastText" => "Keine Prognose"
     ];
 }
 
@@ -345,8 +358,150 @@ function calculateNumbers($event, $totalSeats, $cacheSeconds, $staleCacheSeconds
         "freeRight" => $freeRight,
         "cached" => $result["cached"],
         "stale" => $result["stale"],
-        "fetchedAt" => $result["fetchedAt"]
+        "fetchedAt" => $result["fetchedAt"],
+        "trendSeats" => null,
+        "trendText" => "Noch kein Vergleich",
+        "forecastText" => "Noch nicht genug Daten"
     ];
+}
+
+function enrichNumbersWithTrend($event, $numbers) {
+    if (!$numbers["ok"] || empty($numbers["fetchedAt"])) {
+        return $numbers;
+    }
+
+    $snapshotFile = snapshotFileForEvent($event);
+    $history = json_decode((string)@file_get_contents($snapshotFile), true);
+
+    if (!is_array($history)) {
+        $history = [];
+    }
+
+    $current = [
+        "fetchedAt" => (int)$numbers["fetchedAt"],
+        "freeTotal" => (int)$numbers["freeTotal"],
+        "blockedSeats" => (int)$numbers["blockedSeats"],
+        "usagePercent" => (float)$numbers["usagePercent"]
+    ];
+
+    $last = isset($history["last"]) && is_array($history["last"]) ? $history["last"] : null;
+    $previous = isset($history["previous"]) && is_array($history["previous"]) ? $history["previous"] : null;
+
+    if ($last === null || (int)$last["fetchedAt"] < $current["fetchedAt"]) {
+        $previous = $last;
+        $last = $current;
+
+        @file_put_contents($snapshotFile, json_encode([
+            "previous" => $previous,
+            "last" => $last
+        ]), LOCK_EX);
+    }
+
+    if ($previous === null || (int)$previous["fetchedAt"] >= (int)$last["fetchedAt"]) {
+        $numbers["trendText"] = "Noch kein Vergleich";
+        $numbers["forecastText"] = "Noch nicht genug Daten";
+        return $numbers;
+    }
+
+    $soldSinceLastFetch = (int)$previous["freeTotal"] - (int)$last["freeTotal"];
+    $seconds = max(1, (int)$last["fetchedAt"] - (int)$previous["fetchedAt"]);
+    $numbers["trendSeats"] = $soldSinceLastFetch;
+
+    if ($soldSinceLastFetch > 0) {
+        $numbers["trendText"] = "+" . $soldSinceLastFetch . " verkauft seit " . date("d.m. H:i", (int)$previous["fetchedAt"]);
+        $soldPerDay = $soldSinceLastFetch / ($seconds / 86400);
+
+        if ($soldPerDay > 0 && $numbers["freeTotal"] > 0) {
+            $daysUntilSoldOut = $numbers["freeTotal"] / $soldPerDay;
+            $forecastTime = time() + (int)round($daysUntilSoldOut * 86400);
+            $numbers["forecastText"] = "bei aktuellem Tempo ca. " . date("d.m.Y", $forecastTime) . " ausverkauft";
+        } else {
+            $numbers["forecastText"] = "ausverkauft";
+        }
+    } elseif ($soldSinceLastFetch < 0) {
+        $numbers["trendText"] = abs($soldSinceLastFetch) . " Plaetze wieder frei seit " . date("d.m. H:i", (int)$previous["fetchedAt"]);
+        $numbers["forecastText"] = "keine Ausverkauft-Prognose";
+    } else {
+        $numbers["trendText"] = "0 verkauft seit " . date("d.m. H:i", (int)$previous["fetchedAt"]);
+        $numbers["forecastText"] = "keine Veraenderung";
+    }
+
+    return $numbers;
+}
+
+function getAdminRows($allShows, $totalSeats, $cacheSeconds, $staleCacheSeconds) {
+    $rows = [];
+
+    foreach ($allShows as $show) {
+        foreach ($show["events"] as $event) {
+            $numbers = calculateNumbers($event, $totalSeats, $cacheSeconds, $staleCacheSeconds);
+            $numbers = enrichNumbersWithTrend($event, $numbers);
+
+            $rows[] = [
+                "show" => $show,
+                "event" => $event,
+                "numbers" => $numbers
+            ];
+        }
+    }
+
+    return $rows;
+}
+
+function excelCell($value, $type = "String") {
+    if ($type === "Number" && is_numeric($value)) {
+        return '<Cell><Data ss:Type="Number">' . $value . '</Data></Cell>';
+    }
+
+    return '<Cell><Data ss:Type="String">' . htmlspecialchars((string)$value, ENT_QUOTES, "UTF-8") . '</Data></Cell>';
+}
+
+function downloadExcel($rows, $today) {
+    $filename = "flbb_zuschauerzahlen_" . date("Y-m-d_H-i") . ".xls";
+
+    header("Content-Type: application/vnd.ms-excel; charset=UTF-8");
+    header("Content-Disposition: attachment; filename=\"" . $filename . "\"");
+    header("Cache-Control: no-store, no-cache, must-revalidate");
+
+    echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+    echo '<?mso-application progid="Excel.Sheet"?>' . "\n";
+    echo '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' . "\n";
+    echo '<Worksheet ss:Name="Zuschauerzahlen"><Table>' . "\n";
+
+    $headers = ["Status", "Stueck", "Vorstellung", "Datum", "Uhrzeit", "Frei", "Belegt", "Auslastung %", "Links frei", "Rechts frei", "Trend", "Prognose", "Datenstand", "Quelle", "Ticketseite"];
+    echo "<Row>";
+    foreach ($headers as $header) {
+        echo excelCell($header);
+    }
+    echo "</Row>\n";
+
+    foreach ($rows as $row) {
+        $event = $row["event"];
+        $numbers = $row["numbers"];
+        $isPast = $event["date_iso"] < $today;
+        $fetchedAt = $numbers["fetchedAt"] ? date("d.m.Y H:i:s", $numbers["fetchedAt"]) : "";
+
+        echo "<Row>";
+        echo excelCell($isPast ? "Archiv" : "Aktuell/Zukunft");
+        echo excelCell($row["show"]["title"]);
+        echo excelCell($event["label"]);
+        echo excelCell($event["date"]);
+        echo excelCell($event["time"]);
+        echo excelCell($numbers["freeTotal"], "Number");
+        echo excelCell($numbers["blockedSeats"], "Number");
+        echo excelCell($numbers["usagePercent"], "Number");
+        echo excelCell($numbers["freeLeft"], "Number");
+        echo excelCell($numbers["freeRight"], "Number");
+        echo excelCell($numbers["trendText"]);
+        echo excelCell($numbers["forecastText"]);
+        echo excelCell($fetchedAt);
+        echo excelCell($event["url"]);
+        echo excelCell($event["referer"]);
+        echo "</Row>\n";
+    }
+
+    echo "</Table></Worksheet></Workbook>";
+    exit;
 }
 
 function getStatusText($numbers) {
@@ -393,10 +548,15 @@ if (!isset($selectedShow["events"][$selectedEventKey])) {
 
 $selectedEvent = $selectedShow["events"][$selectedEventKey];
 $numbers = calculateNumbers($selectedEvent, $totalSeats, $cacheSeconds, $staleCacheSeconds);
+$numbers = enrichNumbersWithTrend($selectedEvent, $numbers);
 $status = getStatusText($numbers);
 
 $lastUpdate = $numbers["fetchedAt"] ? date("d.m.Y H:i:s", $numbers["fetchedAt"]) : date("d.m.Y H:i:s");
 $showArchive = $isAdmin && isset($_GET["archive"]) && $_GET["archive"] === "1";
+
+if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
+    downloadExcel(getAdminRows($allShows, $totalSeats, $cacheSeconds, $staleCacheSeconds), $today);
+}
 ?>
 
 <!DOCTYPE html>
@@ -1065,6 +1225,18 @@ $showArchive = $isAdmin && isset($_GET["archive"]) && $_GET["archive"] === "1";
             <div class="label">Rechts frei</div>
             <div class="number green"><?= safe($numbers["freeRight"]) ?></div>
         </div>
+
+        <?php if ($isAdmin): ?>
+            <div class="card">
+                <div class="label">Trend seit letztem Abruf</div>
+                <div class="number blue" style="font-size: 22px; line-height: 1.25;"><?= safe($numbers["trendText"]) ?></div>
+            </div>
+
+            <div class="card">
+                <div class="label">Prognose</div>
+                <div class="number dark" style="font-size: 22px; line-height: 1.25;"><?= safe($numbers["forecastText"]) ?></div>
+            </div>
+        <?php endif; ?>
     </div>
 
     <div class="source">
@@ -1083,11 +1255,18 @@ $showArchive = $isAdmin && isset($_GET["archive"]) && $_GET["archive"] === "1";
                 Die Tabelle nutzt den Zwischenspeicher und wird erst auf Klick geladen.
             </div>
 
+            <div class="header-actions" style="margin-bottom: 16px;">
+                <a class="ticket-link" href="?download=excel">
+                    Excel herunterladen
+                </a>
+            </div>
+
             <?php if (!$showArchive): ?>
                 <a class="ticket-link" href="?show=<?= safe($selectedShowKey) ?>&event=<?= safe($selectedEventKey) ?>&archive=1">
                     Archiv laden
                 </a>
             <?php else: ?>
+            <?php $adminRows = getAdminRows($allShows, $totalSeats, $cacheSeconds, $staleCacheSeconds); ?>
             <div class="admin-table-wrap">
                 <table class="admin-table">
                     <thead>
@@ -1100,26 +1279,30 @@ $showArchive = $isAdmin && isset($_GET["archive"]) && $_GET["archive"] === "1";
                             <th>Auslastung</th>
                             <th>Links frei</th>
                             <th>Rechts frei</th>
+                            <th>Trend</th>
+                            <th>Prognose</th>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php foreach ($allShows as $adminShow): ?>
-                            <?php foreach ($adminShow["events"] as $adminEvent): ?>
-                                <?php
-                                    $adminNumbers = calculateNumbers($adminEvent, $totalSeats, $cacheSeconds, $staleCacheSeconds);
-                                    $isPast = $adminEvent["date_iso"] < $today;
-                                ?>
-                                <tr class="<?= $isPast ? "past" : "future" ?>">
-                                    <td><?= $isPast ? "Archiv" : "Aktuell/Zukunft" ?></td>
-                                    <td><?= safe($adminShow["title"]) ?></td>
-                                    <td><?= safe($adminEvent["label"]) ?></td>
-                                    <td><?= safe($adminNumbers["freeTotal"]) ?></td>
-                                    <td><?= safe($adminNumbers["blockedSeats"]) ?></td>
-                                    <td><?= safe($adminNumbers["usagePercent"]) ?>%</td>
-                                    <td><?= safe($adminNumbers["freeLeft"]) ?></td>
-                                    <td><?= safe($adminNumbers["freeRight"]) ?></td>
-                                </tr>
-                            <?php endforeach; ?>
+                        <?php foreach ($adminRows as $adminRow): ?>
+                            <?php
+                                $adminShow = $adminRow["show"];
+                                $adminEvent = $adminRow["event"];
+                                $adminNumbers = $adminRow["numbers"];
+                                $isPast = $adminEvent["date_iso"] < $today;
+                            ?>
+                            <tr class="<?= $isPast ? "past" : "future" ?>">
+                                <td><?= $isPast ? "Archiv" : "Aktuell/Zukunft" ?></td>
+                                <td><?= safe($adminShow["title"]) ?></td>
+                                <td><?= safe($adminEvent["label"]) ?></td>
+                                <td><?= safe($adminNumbers["freeTotal"]) ?></td>
+                                <td><?= safe($adminNumbers["blockedSeats"]) ?></td>
+                                <td><?= safe($adminNumbers["usagePercent"]) ?>%</td>
+                                <td><?= safe($adminNumbers["freeLeft"]) ?></td>
+                                <td><?= safe($adminNumbers["freeRight"]) ?></td>
+                                <td><?= safe($adminNumbers["trendText"]) ?></td>
+                                <td><?= safe($adminNumbers["forecastText"]) ?></td>
+                            </tr>
                         <?php endforeach; ?>
                     </tbody>
                 </table>
