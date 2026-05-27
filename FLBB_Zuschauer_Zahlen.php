@@ -448,32 +448,21 @@ function getAdminRows($allShows, $totalSeats, $cacheSeconds, $staleCacheSeconds)
     return $rows;
 }
 
-function excelCell($value, $type = "String") {
-    if ($type === "Number" && is_numeric($value)) {
-        return '<Cell><Data ss:Type="Number">' . $value . '</Data></Cell>';
-    }
-
-    return '<Cell><Data ss:Type="String">' . htmlspecialchars((string)$value, ENT_QUOTES, "UTF-8") . '</Data></Cell>';
-}
-
 function downloadExcel($rows, $today) {
-    $filename = "flbb_zuschauerzahlen_" . date("Y-m-d_H-i") . ".xls";
+    $filename = "flbb_zuschauerzahlen_" . date("Y-m-d_H-i") . ".csv";
 
-    header("Content-Type: application/vnd.ms-excel; charset=UTF-8");
+    header("Content-Type: text/csv; charset=UTF-8");
     header("Content-Disposition: attachment; filename=\"" . $filename . "\"");
     header("Cache-Control: no-store, no-cache, must-revalidate");
+    header("X-Content-Type-Options: nosniff");
 
-    echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
-    echo '<?mso-application progid="Excel.Sheet"?>' . "\n";
-    echo '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' . "\n";
-    echo '<Worksheet ss:Name="Zuschauerzahlen"><Table>' . "\n";
+    echo "\xEF\xBB\xBF";
+    echo "sep=;\r\n";
+
+    $output = fopen("php://output", "w");
 
     $headers = ["Status", "Stueck", "Vorstellung", "Datum", "Uhrzeit", "Frei", "Belegt", "Auslastung %", "Links frei", "Rechts frei", "Trend", "Prognose", "Datenstand", "Quelle", "Ticketseite"];
-    echo "<Row>";
-    foreach ($headers as $header) {
-        echo excelCell($header);
-    }
-    echo "</Row>\n";
+    fputcsv($output, $headers, ";");
 
     foreach ($rows as $row) {
         $event = $row["event"];
@@ -481,26 +470,26 @@ function downloadExcel($rows, $today) {
         $isPast = $event["date_iso"] < $today;
         $fetchedAt = $numbers["fetchedAt"] ? date("d.m.Y H:i:s", $numbers["fetchedAt"]) : "";
 
-        echo "<Row>";
-        echo excelCell($isPast ? "Archiv" : "Aktuell/Zukunft");
-        echo excelCell($row["show"]["title"]);
-        echo excelCell($event["label"]);
-        echo excelCell($event["date"]);
-        echo excelCell($event["time"]);
-        echo excelCell($numbers["freeTotal"], "Number");
-        echo excelCell($numbers["blockedSeats"], "Number");
-        echo excelCell($numbers["usagePercent"], "Number");
-        echo excelCell($numbers["freeLeft"], "Number");
-        echo excelCell($numbers["freeRight"], "Number");
-        echo excelCell($numbers["trendText"]);
-        echo excelCell($numbers["forecastText"]);
-        echo excelCell($fetchedAt);
-        echo excelCell($event["url"]);
-        echo excelCell($event["referer"]);
-        echo "</Row>\n";
+        fputcsv($output, [
+            $isPast ? "Archiv" : "Aktuell/Zukunft",
+            $row["show"]["title"],
+            $event["label"],
+            $event["date"],
+            $event["time"],
+            $numbers["freeTotal"],
+            $numbers["blockedSeats"],
+            $numbers["usagePercent"],
+            $numbers["freeLeft"],
+            $numbers["freeRight"],
+            $numbers["trendText"],
+            $numbers["forecastText"],
+            $fetchedAt,
+            $event["url"],
+            $event["referer"]
+        ], ";");
     }
 
-    echo "</Table></Worksheet></Workbook>";
+    fclose($output);
     exit;
 }
 
