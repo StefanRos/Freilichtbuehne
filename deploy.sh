@@ -3,7 +3,7 @@ set -e
 cd /opt/apps/freilichtbuehne
 git pull
 mkdir -p data/backups
-chmod -R 777 data
+docker run --rm -v "$PWD/data:/data" alpine sh -c "mkdir -p /data/backups && chmod -R 777 /data"
 docker compose build
 docker compose up -d
 docker compose ps
