@@ -266,6 +266,156 @@ function formatShortLabel($dateIso, $timeText, $extra = "") {
     return $extra !== "" ? $label . " · " . $extra : $label;
 }
 
+function sortEventsByDate($events) {
+    uasort($events, function ($a, $b) {
+        return strcmp(($a["date_iso"] ?? "") . ($a["time"] ?? ""), ($b["date_iso"] ?? "") . ($b["time"] ?? ""));
+    });
+
+    return $events;
+}
+
+function eventRefererFromJsonLink($eventJsonLink) {
+    $eventJsonLink = trim($eventJsonLink);
+
+    if (!filter_var($eventJsonLink, FILTER_VALIDATE_URL) || !str_ends_with($eventJsonLink, "/event.json")) {
+        return ["ok" => false, "error" => "Bitte einen gültigen event.json-Link eintragen.", "id" => "", "referer" => ""];
+    }
+
+    if (preg_match('~^(.+)/seating/([^/]+)/event\.json$~', $eventJsonLink, $matches)) {
+        return [
+            "ok" => true,
+            "error" => null,
+            "id" => $matches[2],
+            "referer" => rtrim($matches[1], "/") . "/" . $matches[2] . "/"
+        ];
+    }
+
+    if (preg_match('~^(.+)/seating/event\.json$~', $eventJsonLink, $matches)) {
+        $path = trim((string)parse_url($matches[1], PHP_URL_PATH), "/");
+        $parts = explode("/", $path);
+        $eventId = end($parts) ?: sha1($eventJsonLink);
+
+        return [
+            "ok" => true,
+            "error" => null,
+            "id" => $eventId,
+            "referer" => rtrim($matches[1], "/") . "/"
+        ];
+    }
+
+    return ["ok" => false, "error" => "Der Link muss wie .../seating/<id>/event.json oder .../seating/event.json aussehen.", "id" => "", "referer" => ""];
+}
+
+function metadataFromPretixEventPage($referer) {
+    $page = fetchPretixPage($referer);
+
+    if (!$page["ok"]) {
+        return ["ok" => false, "error" => $page["error"], "date_iso" => "", "time" => ""];
+    }
+
+    $html = $page["html"];
+    $startDate = firstRegex('/"startDate":\s*"([^"]+)"/i', $html);
+
+    if ($startDate !== "") {
+        try {
+            $date = new DateTime($startDate);
+            $date->setTimezone(new DateTimeZone("Europe/Berlin"));
+
+            return [
+                "ok" => true,
+                "error" => null,
+                "date_iso" => $date->format("Y-m-d"),
+                "time" => $date->format("H:i") . " Uhr"
+            ];
+        } catch (Exception $e) {
+        }
+    }
+
+    $dateIso = firstRegex('/<time[^>]+datetime="(\d{4}-\d{2}-\d{2})"/i', $html);
+    $timeText = firstRegex('/<time[^>]+datetime="\d{4}-\d{2}-\d{2}T[^"]+">([^<]+)<\/time>/i', $html);
+
+    if ($dateIso !== "" && $timeText !== "") {
+        $timeText = preg_match('/^\d{1,2}:\d{2}$/', $timeText) ? $timeText . " Uhr" : $timeText;
+
+        return [
+            "ok" => true,
+            "error" => null,
+            "date_iso" => $dateIso,
+            "time" => $timeText
+        ];
+    }
+
+    return ["ok" => false, "error" => "Datum und Uhrzeit konnten aus der Pretix-Seite nicht gelesen werden.", "date_iso" => "", "time" => ""];
+}
+
+function buildEventFromEventJsonLink($eventJsonLink, $extraLabel = "") {
+    $referer = eventRefererFromJsonLink($eventJsonLink);
+
+    if (!$referer["ok"]) {
+        return ["ok" => false, "error" => $referer["error"], "event" => null, "key" => ""];
+    }
+
+    $metadata = metadataFromPretixEventPage($referer["referer"]);
+
+    if (!$metadata["ok"]) {
+        return ["ok" => false, "error" => $metadata["error"], "event" => null, "key" => ""];
+    }
+
+    $event = makeEvent(
+        $referer["id"],
+        formatShortLabel($metadata["date_iso"], $metadata["time"], trim($extraLabel)),
+        formatDateText($metadata["date_iso"]),
+        $metadata["time"],
+        $metadata["date_iso"],
+        trim($eventJsonLink),
+        $referer["referer"]
+    );
+
+    return ["ok" => true, "error" => null, "event" => $event, "key" => $referer["id"]];
+}
+
+function buildShowFromEventJsonLinks($title, $subtitle, $image, $linksText) {
+    $title = trim($title);
+    $subtitle = trim($subtitle);
+    $image = trim($image);
+    $links = array_filter(array_map("trim", preg_split('/\R+/', trim($linksText))));
+    $events = [];
+
+    if ($title === "") {
+        return ["ok" => false, "error" => "Bitte einen Titel eintragen.", "show" => null, "key" => null];
+    }
+
+    if (!filter_var($image, FILTER_VALIDATE_URL)) {
+        return ["ok" => false, "error" => "Bitte einen gültigen Bild-Link eintragen.", "show" => null, "key" => null];
+    }
+
+    if (count($links) === 0) {
+        return ["ok" => false, "error" => "Bitte mindestens einen event.json-Link eintragen.", "show" => null, "key" => null];
+    }
+
+    foreach ($links as $link) {
+        $eventResult = buildEventFromEventJsonLink($link);
+
+        if (!$eventResult["ok"]) {
+            return ["ok" => false, "error" => $eventResult["error"] . " Link: " . $link, "show" => null, "key" => null];
+        }
+
+        $events[$eventResult["key"]] = $eventResult["event"];
+    }
+
+    return [
+        "ok" => true,
+        "error" => null,
+        "key" => slugFromText($title),
+        "show" => [
+            "title" => $title,
+            "subtitle" => $subtitle !== "" ? $subtitle : "Veranstaltung",
+            "image" => $image,
+            "events" => sortEventsByDate($events)
+        ]
+    ];
+}
+
 function buildPretixShowFromLink($link, $titleOverride = "", $subtitleOverride = "", $imageOverride = "") {
     $link = trim($link);
 
@@ -353,7 +503,11 @@ if ($isAdmin && $_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["admin_act
     $action = $_POST["admin_action"];
 
     if ($action === "import_show") {
-        $import = buildPretixShowFromLink($_POST["pretix_link"] ?? "", trim($_POST["title"] ?? ""), trim($_POST["subtitle"] ?? ""), trim($_POST["image"] ?? ""));
+        if (!empty(trim($_POST["event_links"] ?? ""))) {
+            $import = buildShowFromEventJsonLinks($_POST["title"] ?? "", $_POST["subtitle"] ?? "", $_POST["image"] ?? "", $_POST["event_links"] ?? "");
+        } else {
+            $import = buildPretixShowFromLink($_POST["pretix_link"] ?? "", trim($_POST["title"] ?? ""), trim($_POST["subtitle"] ?? ""), trim($_POST["image"] ?? ""));
+        }
 
         if ($import["ok"]) {
             $key = uniqueShowKey($shows, $import["key"]);
@@ -369,6 +523,27 @@ if ($isAdmin && $_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["admin_act
         }
     }
 
+    if ($action === "add_event") {
+        $showKey = $_POST["show_key"] ?? "";
+
+        if (isset($shows[$showKey])) {
+            $eventResult = buildEventFromEventJsonLink($_POST["event_link"] ?? "", trim($_POST["extra_label"] ?? ""));
+
+            if ($eventResult["ok"]) {
+                $shows[$showKey]["events"][$eventResult["key"]] = $eventResult["event"];
+                $shows[$showKey]["events"] = sortEventsByDate($shows[$showKey]["events"]);
+
+                if (saveEditableShows($shows)) {
+                    $adminMessage = "Vorstellung wurde hinzugefügt.";
+                } else {
+                    $adminError = "Vorstellung konnte nicht gespeichert werden.";
+                }
+            } else {
+                $adminError = $eventResult["error"];
+            }
+        }
+    }
+
     if ($action === "update_show") {
         $showKey = $_POST["show_key"] ?? "";
 
@@ -381,6 +556,60 @@ if ($isAdmin && $_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["admin_act
                 $adminMessage = "Veranstaltung wurde gespeichert.";
             } else {
                 $adminError = "Veranstaltung konnte nicht gespeichert werden.";
+            }
+        }
+    }
+
+    if ($action === "update_event") {
+        $showKey = $_POST["show_key"] ?? "";
+        $eventKey = $_POST["event_key"] ?? "";
+
+        if (isset($shows[$showKey]["events"][$eventKey])) {
+            $event = $shows[$showKey]["events"][$eventKey];
+            $newEventKey = trim($_POST["event_id"] ?? $event["id"]);
+            $dateIso = trim($_POST["date_iso"] ?? $event["date_iso"]);
+            $timeText = trim($_POST["time"] ?? $event["time"]);
+            $label = trim($_POST["label"] ?? "");
+
+            if ($newEventKey === "" || $dateIso === "" || $timeText === "" || !filter_var($_POST["url"] ?? "", FILTER_VALIDATE_URL) || !filter_var($_POST["referer"] ?? "", FILTER_VALIDATE_URL)) {
+                $adminError = "Bitte alle Pflichtfelder der Vorstellung korrekt ausfüllen.";
+            } else {
+                unset($shows[$showKey]["events"][$eventKey]);
+                $shows[$showKey]["events"][$newEventKey] = makeEvent(
+                    $newEventKey,
+                    $label !== "" ? $label : formatShortLabel($dateIso, $timeText),
+                    formatDateText($dateIso),
+                    $timeText,
+                    $dateIso,
+                    trim($_POST["url"]),
+                    trim($_POST["referer"])
+                );
+                $shows[$showKey]["events"] = sortEventsByDate($shows[$showKey]["events"]);
+
+                if (saveEditableShows($shows)) {
+                    $adminMessage = "Vorstellung wurde gespeichert.";
+                } else {
+                    $adminError = "Vorstellung konnte nicht gespeichert werden.";
+                }
+            }
+        }
+    }
+
+    if ($action === "delete_event") {
+        $showKey = $_POST["show_key"] ?? "";
+        $eventKey = $_POST["event_key"] ?? "";
+
+        if (isset($shows[$showKey]["events"][$eventKey])) {
+            if (count($shows[$showKey]["events"]) <= 1) {
+                $adminError = "Die letzte Vorstellung einer Veranstaltung kann nicht gelöscht werden.";
+            } else {
+                unset($shows[$showKey]["events"][$eventKey]);
+
+                if (saveEditableShows($shows)) {
+                    $adminMessage = "Vorstellung wurde gelöscht.";
+                } else {
+                    $adminError = "Vorstellung konnte nicht gelöscht werden.";
+                }
             }
         }
     }
@@ -1292,6 +1521,18 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
             background: #ffffff;
         }
 
+        .admin-form textarea {
+            width: 100%;
+            min-height: 96px;
+            border: 1px solid #d1d5db;
+            border-radius: 10px;
+            padding: 10px 12px;
+            font-size: 14px;
+            color: #111827;
+            background: #ffffff;
+            resize: vertical;
+        }
+
         .admin-show-list {
             display: grid;
             gap: 12px;
@@ -1312,6 +1553,25 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
             color: #4b5563;
             font-size: 12px;
             font-weight: 800;
+        }
+
+        .admin-event-list {
+            display: grid;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .admin-event-edit {
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 12px;
+            background: #ffffff;
+        }
+
+        .admin-event-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
         }
 
         .admin-actions-row {
@@ -1392,6 +1652,10 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
             }
 
             .admin-management {
+                grid-template-columns: 1fr;
+            }
+
+            .admin-event-grid {
                 grid-template-columns: 1fr;
             }
 
@@ -1479,13 +1743,8 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
                     <input type="hidden" name="admin_action" value="import_show">
 
                     <label>
-                        Neuer Pretix-Link
-                        <input type="url" name="pretix_link" placeholder="https://tickets.freilichtspiele-badbentheim.de/.../" required>
-                    </label>
-
-                    <label>
-                        Titel überschreiben
-                        <input type="text" name="title" placeholder="optional, sonst aus Pretix">
+                        Titel
+                        <input type="text" name="title" placeholder="z. B. Der gestiefelte Kater" required>
                     </label>
 
                     <label>
@@ -1494,11 +1753,16 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
                     </label>
 
                     <label>
-                        Bild überschreiben
-                        <input type="url" name="image" placeholder="optional, sonst aus Pretix">
+                        Bild-Link
+                        <input type="url" name="image" placeholder="https://..." required>
                     </label>
 
-                    <button class="submit-button" type="submit" style="padding: 12px 14px;">Aus Pretix importieren</button>
+                    <label>
+                        Vorstellungslinks
+                        <textarea name="event_links" placeholder="Pro Zeile ein Link, z. B.&#10;https://tickets.freilichtspiele-badbentheim.de/kater26/seating/4749896/event.json" required></textarea>
+                    </label>
+
+                    <button class="submit-button" type="submit" style="padding: 12px 14px;">Veranstaltung anlegen</button>
                 </form>
 
                 <div class="admin-show-list">
@@ -1532,6 +1796,80 @@ if ($isAdmin && isset($_GET["download"]) && $_GET["download"] === "excel") {
                                     <button class="submit-button" type="submit" style="padding: 10px 14px;">Speichern</button>
                                 </div>
                             </form>
+
+                            <div class="admin-event-list">
+                                <?php foreach ($editShow["events"] as $editEventKey => $editEvent): ?>
+                                    <div class="admin-event-edit">
+                                        <form method="post" class="admin-form">
+                                            <input type="hidden" name="admin_action" value="update_event">
+                                            <input type="hidden" name="show_key" value="<?= safe($editShowKey) ?>">
+                                            <input type="hidden" name="event_key" value="<?= safe($editEventKey) ?>">
+
+                                            <div class="admin-event-grid">
+                                                <label>
+                                                    Event-ID
+                                                    <input type="text" name="event_id" value="<?= safe($editEvent["id"]) ?>" required>
+                                                </label>
+
+                                                <label>
+                                                    Datum
+                                                    <input type="date" name="date_iso" value="<?= safe($editEvent["date_iso"]) ?>" required>
+                                                </label>
+
+                                                <label>
+                                                    Uhrzeit
+                                                    <input type="text" name="time" value="<?= safe($editEvent["time"]) ?>" required>
+                                                </label>
+
+                                                <label>
+                                                    Label
+                                                    <input type="text" name="label" value="<?= safe($editEvent["label"]) ?>">
+                                                </label>
+                                            </div>
+
+                                            <label>
+                                                event.json-Link
+                                                <input type="url" name="url" value="<?= safe($editEvent["url"]) ?>" required>
+                                            </label>
+
+                                            <label>
+                                                Ticket-Link
+                                                <input type="url" name="referer" value="<?= safe($editEvent["referer"]) ?>" required>
+                                            </label>
+
+                                            <div class="admin-actions-row">
+                                                <button class="submit-button" type="submit" style="padding: 10px 14px;">Vorstellung speichern</button>
+                                            </div>
+                                        </form>
+
+                                        <form method="post" onsubmit="return confirm('Diese Vorstellung wirklich löschen?');" style="margin-top: 8px;">
+                                            <input type="hidden" name="admin_action" value="delete_event">
+                                            <input type="hidden" name="show_key" value="<?= safe($editShowKey) ?>">
+                                            <input type="hidden" name="event_key" value="<?= safe($editEventKey) ?>">
+                                            <button class="admin-danger-button" type="submit">Vorstellung löschen</button>
+                                        </form>
+                                    </div>
+                                <?php endforeach; ?>
+
+                                <div class="admin-event-edit">
+                                    <form method="post" class="admin-form">
+                                        <input type="hidden" name="admin_action" value="add_event">
+                                        <input type="hidden" name="show_key" value="<?= safe($editShowKey) ?>">
+
+                                        <label>
+                                            Neue Vorstellung per event.json-Link
+                                            <input type="url" name="event_link" placeholder="https://tickets.freilichtspiele-badbentheim.de/.../seating/.../event.json" required>
+                                        </label>
+
+                                        <label>
+                                            Zusatz im Label
+                                            <input type="text" name="extra_label" placeholder="optional, z. B. Premiere">
+                                        </label>
+
+                                        <button class="submit-button" type="submit" style="padding: 10px 14px;">Vorstellung hinzufügen</button>
+                                    </form>
+                                </div>
+                            </div>
 
                             <form method="post" onsubmit="return confirm('Diese Veranstaltung wirklich löschen?');" style="margin-top: 8px;">
                                 <input type="hidden" name="admin_action" value="delete_show">
